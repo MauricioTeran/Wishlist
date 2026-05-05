@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 )
 
 type WishlistItem struct {
@@ -13,7 +15,10 @@ type WishlistItem struct {
 	VueloId   int `json:"vueloId"`
 }
 
-var wishlist []WishlistItem
+var (
+	mu       sync.RWMutex
+	wishlist = make(map[int]map[int]bool)
+)
 
 func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -44,22 +49,34 @@ func agregar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, it := range wishlist {
-		if it.UsuarioId == item.UsuarioId && it.VueloId == item.VueloId {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintln(w, `{"mensaje": "Ya está en la wishlist"}`)
-			return
-		}
+	mu.Lock()
+	defer mu.Unlock()
+
+	if wishlist[item.UsuarioId] == nil {
+		wishlist[item.UsuarioId] = make(map[int]bool)
 	}
 
-	wishlist = append(wishlist, item)
+	if wishlist[item.UsuarioId][item.VueloId] {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"mensaje": "Ya está en la wishlist"}`)
+		return
+	}
+
+	wishlist[item.UsuarioId][item.VueloId] = true
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintln(w, `{"mensaje": "Agregado correctamente"}`)
 }
 
 func obtener(w http.ResponseWriter, r *http.Request) {
-	usuarioId := r.URL.Path[len("/wishlist/"):]
-	userId, err := strconv.Atoi(usuarioId)
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 3 {
+		http.Error(w, `{"error": "Usuario inválido"}`, http.StatusBadRequest)
+		return
+	}
+
+	userId, err := strconv.Atoi(pathParts[2])
 	if err != nil {
 		http.Error(w, `{"error": "Usuario inválido"}`, http.StatusBadRequest)
 		return
@@ -72,9 +89,13 @@ func obtener(w http.ResponseWriter, r *http.Request) {
 
 	var resultado []map[string]interface{}
 
-	for _, it := range wishlist {
-		if it.UsuarioId == userId {
-			resp, err := http.Get(fmt.Sprintf("%s/vuelos/%d", ticketsURL, it.VueloId))
+	mu.RLock()
+	userVuelos := wishlist[userId]
+	mu.RUnlock()
+
+	if userVuelos != nil {
+		for vueloId := range userVuelos {
+			resp, err := http.Get(fmt.Sprintf("%s/vuelos/%d", ticketsURL, vueloId))
 			if err == nil && resp.StatusCode == 200 {
 				var vuelo map[string]interface{}
 				if err := json.NewDecoder(resp.Body).Decode(&vuelo); err == nil {
@@ -102,16 +123,36 @@ func eliminar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var nueva []WishlistItem
-	for _, it := range wishlist {
-		if !(it.UsuarioId == item.UsuarioId && it.VueloId == item.VueloId) {
-			nueva = append(nueva, it)
-		}
+	mu.Lock()
+	defer mu.Unlock()
+
+	if wishlist[item.UsuarioId] != nil {
+		delete(wishlist[item.UsuarioId], item.VueloId)
 	}
 
-	wishlist = nueva
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintln(w, `{"mensaje": "Eliminado"}`)
+	fmt.Fprintln(w, `{"mensaje": "Item eliminado del carrito"}`)
+}
+
+func vaciarCarrito(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 4 {
+		http.Error(w, `{"error": "Ruta inválida"}`, http.StatusBadRequest)
+		return
+	}
+
+	userId, err := strconv.Atoi(pathParts[2])
+	if err != nil {
+		http.Error(w, `{"error": "Usuario inválido"}`, http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	delete(wishlist, userId)
+	mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintln(w, `{"mensaje": "Carrito reiniciado por logout"}`)
 }
 
 func main() {
@@ -128,7 +169,16 @@ func main() {
 		}
 	}))
 
-	http.HandleFunc("/wishlist/", enableCORS(obtener))
+	// Maneja las peticiones con ID en la URL
+	http.HandleFunc("/wishlist/", enableCORS(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/clear") && r.Method == "DELETE" {
+			vaciarCarrito(w, r)
+		} else if r.Method == "GET" {
+			obtener(w, r)
+		} else {
+			http.Error(w, `{"error": "Método no permitido"}`, http.StatusMethodNotAllowed)
+		}
+	}))
 
 	fmt.Println("Servidor de Wishlist (Go) corriendo en puerto 8082")
 	http.ListenAndServe(":8082", nil)
